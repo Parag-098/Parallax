@@ -1,0 +1,178 @@
+{
+  "name": "parallax",
+  "displayName": "Parallax",
+  "description": "Local-first VS Code development time machine",
+  "version": "0.1.0",
+  "publisher": "parallax",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "history",
+    "timeline",
+    "replay",
+    "time-machine",
+    "developer-tools"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "parallax.startRecording",
+        "title": "Parallax: Start Recording",
+        "icon": "$(record)"
+      },
+      {
+        "command": "parallax.stopRecording",
+        "title": "Parallax: Stop Recording",
+        "icon": "$(stop-circle)"
+      },
+      {
+        "command": "parallax.openTimeline",
+        "title": "Parallax: Open Timeline",
+        "icon": "$(timeline-view-icon)"
+      },
+      {
+        "command": "parallax.createCheckpoint",
+        "title": "Parallax: Create Checkpoint",
+        "icon": "$(bookmark)"
+      }
+    ],
+    "configuration": {
+      "title": "Parallax",
+      "properties": {
+        "parallax.recordingEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable or disable Parallax recording on startup."
+        },
+        "parallax.snapshotIntervalMinutes": {
+          "type": "number",
+          "default": 30,
+          "minimum": 5,
+          "maximum": 1440,
+          "description": "Interval in minutes between automatic full snapshots."
+        },
+        "parallax.excludePatterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "node_modules",
+            ".git",
+            "dist",
+            "build",
+            "coverage",
+            "out",
+            ".next",
+            ".nuxt",
+            "vendor",
+            "__pycache__",
+            ".venv",
+            "venv",
+            ".DS_Store",
+            "*.log",
+            "*.lock",
+            "package-lock.json",
+            "yarn.lock"
+          ],
+          "description": "Glob patterns and directory names to exclude from recording."
+        },
+        "parallax.maxEventsPerSession": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 100,
+          "maximum": 100000,
+          "description": "Maximum number of events to keep per session."
+        },
+        "parallax.debounceMs": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 100,
+          "maximum": 30000,
+          "description": "Debounce interval in milliseconds for file modification events."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "parallax-sidebar",
+          "title": "Parallax",
+          "icon": "$(history)"
+        }
+      ]
+    },
+    "views": {
+      "parallax-sidebar": [
+        {
+          "id": "parallax.timelineView",
+          "name": "Timeline",
+          "type": "webview"
+        }
+      ]
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "parallax.startRecording"
+        },
+        {
+          "command": "parallax.stopRecording"
+        },
+        {
+          "command": "parallax.openTimeline"
+        },
+        {
+          "command": "parallax.createCheckpoint"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "npm run build:extension && npm run build:webview",
+    "build:extension": "tsc -p tsconfig.json",
+    "build:webview": "webpack --config webpack.webview.config.js",
+    "watch": "tsc -p tsconfig.json --watch",
+    "watch:webview": "webpack --config webpack.webview.config.js --watch",
+    "test": "npx tsc -p tsconfig.test.json && npx mocha \"out/test/**/*.test.js\" --timeout 10000 --exit",
+    "lint": "eslint src --ext ts",
+    "pretest": "npm run build:extension"
+  },
+  "devDependencies": {
+    "@types/diff": "^5.2.1",
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^20.11.5",
+    "@types/react": "^18.2.48",
+    "@types/react-dom": "^18.2.18",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.19.1",
+    "@typescript-eslint/parser": "^6.19.1",
+    "@vscode/test-electron": "^2.3.8",
+    "css-loader": "^6.10.0",
+    "eslint": "^8.56.0",
+    "mocha": "^10.2.0",
+    "style-loader": "^3.3.4",
+    "ts-loader": "^9.5.1",
+    "ts-node": "^10.9.2",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "^5.3.3",
+    "webpack": "^5.90.0",
+    "webpack-cli": "^5.1.4"
+  },
+  "dependencies": {
+    "diff": "^5.2.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "uuid": "^9.0.0",
+    "@types/uuid": "^9.0.7"
+  }
+}
