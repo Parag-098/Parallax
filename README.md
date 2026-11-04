@@ -1,4 +1,4 @@
-# Parallax
+﻿# Parallax
 
 Parallax is a local-first VS Code extension for inspecting text-file development history. History stays under VS Code global extension storage, isolated by a hash of the workspace roots. The extension has no telemetry or cloud service.
 
@@ -56,7 +56,7 @@ npm test
 npm run test:integration
 ```
 
-Press **F5** to launch the Extension Development Host, open a project folder, then select the Parallax Activity Bar view. `npm run test:integration` launches the official VS Code test host on an isolated workspace. `npm test` includes core and browser-DOM webview interaction tests. Run `npm run package` to create a VSIX. A license has not been selected; the VSIX must not be published until the project owner chooses licensing terms and adds the corresponding license file.
+Press **F5** to launch the Extension Development Host, open a project folder, then select the Parallax Activity Bar view. `npm run test:integration` launches the official VS Code test host on an isolated workspace. `npm test` includes core and browser-DOM webview interaction tests. Run `npm run package` to create a VSIX. The project is licensed under the MIT License; see [LICENSE](LICENSE).
 
 For a packaged-extension host probe after installing the VSIX into an isolated extension directory, set `PARALLAX_INSTALLED_EXTENSION`, `PARALLAX_INSTALL_PROFILE`, and optionally `VSCODE_EXECUTABLE`, then run `npm run test:package-host`. The final VSIX was installed into a clean profile and passed the packaged-host suite, including Activity Bar/view contributions, activation, recording, root changes, and opening reconstructed history as a read-only TypeScript document. Browser-DOM tests cover timeline, compare, replay, checkpoint, and restore-preview requests. Manual visual review of light/dark/high-contrast themes and panel widths remains outstanding.
 

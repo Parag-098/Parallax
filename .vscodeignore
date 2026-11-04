@@ -17,3 +17,4 @@ ARCHITECTURE.md
 README-DOCS.md
 .gitignore
 !node_modules/diff/libcjs/package.json
+square-image.jpg

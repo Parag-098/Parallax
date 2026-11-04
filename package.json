@@ -3,8 +3,8 @@
   "displayName": "Parallax",
   "description": "Local-first development history for VS Code",
   "version": "0.1.0",
-  "publisher": "parallax-dev",
-  "license": "MIT",
+  "publisher": "parag-098",
+  "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -105,7 +105,7 @@
     "compile-tests": "tsc -p tsconfig.test.json",
     "test": "npm run compile-tests && mocha \"out/test/**/*.test.js\" --timeout 10000",
     "test:integration": "npm run build && npm run compile-tests && node out/test/integration/run.js",
-    "package": "npx --yes @vscode/vsce@2.27.0 package --allow-missing-repository",
+    "package": "npx --yes @vscode/vsce@4.1.0 package",
     "test:package-host": "npm run compile-tests && node out/test/integration/run-installed.js"
   },
   "dependencies": {
@@ -135,5 +135,14 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/Parag-098/Parallax.git"
-  }
+  },
+  "icon": "parallax-icon.png",
+  "keywords": [
+    "development history",
+    "local-first",
+    "checkpoints",
+    "snapshots",
+    "replay",
+    "developer tools"
+  ]
 }
