@@ -1,403 +1,152 @@
-/**
- * Parallax VS Code extension entry point.
- * Wires all modules together and manages the extension lifecycle.
- */
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { v4 as uuidv4 } from 'uuid';
+import * as fs from 'fs/promises';
+import { constants as fsConstants } from 'fs';
+import { randomUUID } from 'crypto';
+import { HistoryStore } from './core/store';
+import { inventoryWorkspace } from './core/inventory';
+import { HistoryEvent, Session } from './core/model';
+import { hashContent, isSupportedText } from './core/content';
+import { isExcluded, visibleRename } from './core/excludes';
+import { reconstruct, reconstructAt, reconstructWorkspaceAt, replayContentReferences } from './core/reconstruct';
+import { asGitApi, GitAwareness } from './core/git';
+import { compareText } from './core/diff';
+import { restoreFile, restoreWorkspace, WorkspaceRestoreEntry } from './core/restore';
+import { SerialQueue } from './core/serial';
+import { isWebviewMessage } from './core/protocol';
 
-import { JsonFileStorage } from './storage/storage';
-import { FileCollector } from './collectors/fileCollector';
-import { ExclusionMatcher } from './collectors/exclusions';
-import { SnapshotEngine } from './snapshots/snapshotEngine';
-import { ReconstructionService } from './snapshots/reconstruction';
-import { GitService } from './git/gitService';
-import { CheckpointService } from './checkpoints/checkpointService';
-import { ReplayEngine } from './replay/replayEngine';
-import { TimelineWebviewProvider } from './webview/timelineProvider';
-import { registerCommands } from './commands/commands';
-import type { ParallaxEvent, Project, Session } from './events/types';
-import {
-  createProjectOpenedEvent,
-  createSessionStartedEvent,
-  createSessionEndedEvent,
-} from './events/factory';
+let session: Session | undefined; let store: HistoryStore | undefined; let seq=0; let recording=false; let stopping=false; let timer: NodeJS.Timeout | undefined; let snapshotTimer: NodeJS.Timeout | undefined;
+let viewedSessionId:string|undefined;let sessionReady:Promise<void>=Promise.resolve();let deactivated=false;let shuttingDown=false;let baselineInProgress=false;let baselineChanged=false;let workspaceGeneration=0;let activeContext:vscode.ExtensionContext|undefined;let provider:TimelineProvider|undefined;const workspaceTransitions=new SerialQueue();
+const recordingTransitions=new SerialQueue();
+const workspaceResources:vscode.Disposable[]=[];let globalsRegistered=false;
+const pending=new Map<string,{timer:NodeJS.Timeout;uri:vscode.Uri;kind:'create'|'modify'|'delete';historyPath:string}>(); const lastHash=new Map<string,string>();
+const inFlight=new Set<Promise<void>>();
+function track(promise:Promise<void>):void{inFlight.add(promise);void promise.catch(error=>console.error('Parallax capture failed',error)).finally(()=>inFlight.delete(promise));}
+let eventPipeline:Promise<void>=Promise.resolve();
+function schedule<T>(task:()=>Promise<T>):Promise<T>{const operation=eventPipeline.then(task);eventPipeline=operation.then(()=>undefined,()=>undefined);track(operation.then(()=>undefined));return operation;}
+function enqueue(task:()=>Promise<void>):void{void schedule(task).catch(error=>console.error('Parallax event pipeline failed',error));}
 
-// ---------------------------------------------------------------------------
-// ParallaxController – central coordinator
-// ---------------------------------------------------------------------------
-
-export class ParallaxController implements vscode.Disposable {
-  private storage: JsonFileStorage;
-  private exclusions: ExclusionMatcher;
-  private collector: FileCollector | undefined;
-  private snapshotEngine: SnapshotEngine | undefined;
-  private gitService: GitService | undefined;
-  private checkpointSvc: CheckpointService | undefined;
-  private replayEngine: ReplayEngine;
-  private reconstructionSvc: ReconstructionService;
-  private webviewProvider: TimelineWebviewProvider | undefined;
-
-  private project: Project | undefined;
-  private activeSession: Session | undefined;
-  private isRecording = false;
-
-  private statusBarItem: vscode.StatusBarItem;
-  private readonly disposables: vscode.Disposable[] = [];
-  private readonly eventBuffer: ParallaxEvent[] = [];
-  private flushTimer: ReturnType<typeof setTimeout> | undefined;
-
-  constructor(
-    private readonly context: vscode.ExtensionContext,
-  ) {
-    this.storage = new JsonFileStorage(context.globalStorageUri);
-    this.exclusions = new ExclusionMatcher();
-    this.replayEngine = new ReplayEngine(this.storage);
-    this.reconstructionSvc = new ReconstructionService(this.storage);
-
-    this.statusBarItem = vscode.window.createStatusBarItem(
-      vscode.StatusBarAlignment.Left,
-      100,
-    );
-    this.statusBarItem.command = 'parallax.openTimeline';
-    this.updateStatusBar();
-    this.statusBarItem.show();
-  }
-
-  // ---------- Lifecycle ----------
-
-  async initialize(): Promise<void> {
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (!workspaceFolders || workspaceFolders.length === 0) {
-      this.updateStatusBar('No workspace');
-      return;
-    }
-
-    const workspaceRoot = workspaceFolders[0].uri.fsPath;
-    const projectId = deriveProjectId(workspaceRoot);
-    const projectName = path.basename(workspaceRoot);
-
-    // Load or create project record
-    let project = await this.storage.loadProject(projectId);
-    if (!project) {
-      project = {
-        projectId,
-        name: projectName,
-        rootPath: workspaceRoot,
-        createdAt: new Date().toISOString(),
-        lastActiveAt: new Date().toISOString(),
-      };
-      await this.storage.saveProject(project);
-
-      const openedEvent = createProjectOpenedEvent(projectId, workspaceRoot, projectName);
-      await this.storage.appendEvent(openedEvent);
-    } else {
-      project.lastActiveAt = new Date().toISOString();
-      await this.storage.saveProject(project);
-    }
-
-    this.project = project;
-
-    // Initialize Git service
-    this.gitService = new GitService(
-      projectId,
-      () => this.activeSession?.sessionId,
-      (event) => this.handleEvent(event),
-    );
-    await this.gitService.initialize();
-
-    // Initialize snapshot engine
-    this.snapshotEngine = new SnapshotEngine(
-      projectId,
-      workspaceRoot,
-      () => this.activeSession?.sessionId,
-      this.storage,
-      (event) => this.handleEvent(event),
-      this.exclusions,
-    );
-
-    // Initialize checkpoint service
-    this.checkpointSvc = new CheckpointService(
-      projectId,
-      () => this.activeSession?.sessionId,
-      this.storage,
-      this.gitService,
-      this.snapshotEngine,
-      (event) => this.handleEvent(event),
-    );
-
-    // Check autostart setting
-    const config = vscode.workspace.getConfiguration('parallax');
-    const autoStart = config.get<boolean>('recordingEnabled') ?? true;
-    if (autoStart) {
-      await this.startRecording();
-    }
-
-    this.updateStatusBar();
-  }
-
-  async startRecording(): Promise<void> {
-    if (!this.project) {
-      void vscode.window.showWarningMessage('Parallax: No workspace open.');
-      return;
-    }
-    if (this.isRecording) {
-      return;
-    }
-
-    const sessionId = uuidv4();
-    const startTime = new Date().toISOString();
-
-    const session: Session = {
-      sessionId,
-      projectId: this.project.projectId,
-      startTime,
-      endTime: undefined,
-      eventCount: 0,
-    };
-    await this.storage.saveSession(session);
-    this.activeSession = session;
-
-    const event = createSessionStartedEvent(this.project.projectId, sessionId);
-    await this.storage.appendEvent(event);
-
-    // Start file collector
-    this.collector = new FileCollector(
-      this.project.projectId,
-      () => this.activeSession?.sessionId,
-      this.storage,
-      (ev) => this.handleEvent(ev),
-      this.exclusions,
-    );
-    await this.collector.preloadCache(this.project.rootPath);
-    this.collector.start();
-
-    // Start auto-snapshot
-    this.snapshotEngine?.startAutoSnapshot();
-
-    this.isRecording = true;
-    this.updateStatusBar();
-    this.webviewProvider?.pushRecordingStatus(true);
-  }
-
-  async stopRecording(): Promise<void> {
-    if (!this.isRecording || !this.activeSession || !this.project) {
-      return;
-    }
-
-    this.collector?.stop();
-    this.snapshotEngine?.stopAutoSnapshot();
-
-    const event = createSessionEndedEvent(
-      this.project.projectId,
-      this.activeSession.sessionId,
-      this.activeSession.startTime,
-    );
-    await this.storage.appendEvent(event);
-
-    const endTime = new Date().toISOString();
-    this.activeSession.endTime = endTime;
-    await this.storage.saveSession(this.activeSession);
-
-    this.isRecording = false;
-    this.activeSession = undefined;
-    this.updateStatusBar();
-    this.webviewProvider?.pushRecordingStatus(false);
-  }
-
-  async createCheckpoint(name: string, description: string): Promise<void> {
-    if (!this.checkpointSvc) {
-      void vscode.window.showWarningMessage('Parallax: No workspace open.');
-      return;
-    }
-    await this.checkpointSvc.createCheckpoint(name, description);
-  }
-
-  isCurrentlyRecording(): boolean {
-    return this.isRecording;
-  }
-
-  getProject(): Project | undefined {
-    return this.project;
-  }
-
-  async getSessions(): Promise<Session[]> {
-    if (!this.project) {
-      return [];
-    }
-    return this.storage.loadSessionsForProject(this.project.projectId);
-  }
-
-  getStorage(): JsonFileStorage {
-    return this.storage;
-  }
-
-  getReplayEngine(): ReplayEngine {
-    return this.replayEngine;
-  }
-
-  getReconstruction(): ReconstructionService {
-    return this.reconstructionSvc;
-  }
-
-  getCheckpointService(): CheckpointService | undefined {
-    return this.checkpointSvc;
-  }
-
-  setWebviewProvider(provider: TimelineWebviewProvider): void {
-    this.webviewProvider = provider;
-  }
-
-  // ---------- Event handling ----------
-
-  private handleEvent(event: ParallaxEvent): void {
-    this.storage.appendEvent(event).catch(() => undefined);
-
-    if (this.activeSession) {
-      this.activeSession.eventCount++;
-      this.storage.saveSession(this.activeSession).catch(() => undefined);
-    }
-
-    // Buffer events and flush to webview in batches
-    this.eventBuffer.push(event);
-    if (this.flushTimer === undefined) {
-      this.flushTimer = setTimeout(() => {
-        this.flushToWebview();
-      }, 500);
-    }
-  }
-
-  private flushToWebview(): void {
-    this.flushTimer = undefined;
-    if (this.eventBuffer.length === 0 || !this.project) {
-      return;
-    }
-
-    this.storage
-      .loadEventsForProject(this.project.projectId)
-      .then((events) => {
-        this.webviewProvider?.pushEventsUpdate(events);
-        this.replayEngine.loadProject(this.project!.projectId).catch(() => undefined);
-      })
-      .catch(() => undefined);
-
-    this.eventBuffer.length = 0;
-  }
-
-  // ---------- Status bar ----------
-
-  private updateStatusBar(message?: string): void {
-    if (message) {
-      this.statusBarItem.text = `$(history) Parallax: ${message}`;
-      return;
-    }
-    if (!this.project) {
-      this.statusBarItem.text = '$(history) Parallax';
-      this.statusBarItem.tooltip = 'Open Parallax timeline';
-      return;
-    }
-    if (this.isRecording) {
-      this.statusBarItem.text = '$(record) Parallax: Recording';
-      this.statusBarItem.tooltip = 'Parallax is recording – click to open timeline';
-      this.statusBarItem.color = new vscode.ThemeColor('statusBarItem.warningForeground');
-    } else {
-      this.statusBarItem.text = '$(history) Parallax: Stopped';
-      this.statusBarItem.tooltip = 'Parallax recording stopped – click to open timeline';
-      this.statusBarItem.color = undefined;
-    }
-  }
-
-  // ---------- Disposable ----------
-
-  dispose(): void {
-    if (this.flushTimer !== undefined) {
-      clearTimeout(this.flushTimer);
-    }
-    this.collector?.dispose();
-    this.snapshotEngine?.dispose();
-    this.gitService?.dispose();
-    this.statusBarItem.dispose();
-    for (const d of this.disposables) {
-      d.dispose();
-    }
-  }
+export function activate(context: vscode.ExtensionContext): void {
+ activeContext=context;context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(()=>{if(shuttingDown||deactivated)return;void workspaceTransitions.run(()=>reconfigureWorkspace(context)).catch(error=>console.error('Could not reconfigure Parallax after workspace root change',error));}));registerGlobal(context);initializeWorkspace(context);
 }
-
-// ---------------------------------------------------------------------------
-// Extension activate / deactivate
-// ---------------------------------------------------------------------------
-
-let controller: ParallaxController | undefined;
-
-export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  try {
-    controller = new ParallaxController(context);
-
-    const checkpointSvcPlaceholder = {
-      createCheckpoint: async (n: string, d: string) =>
-        controller!.createCheckpoint(n, d),
-      listCheckpoints: async () => {
-        if (!controller?.getCheckpointService()) {
-          return [];
-        }
-        return controller!.getCheckpointService()!.listCheckpoints();
-      },
-    };
-
-    const webviewProvider = new TimelineWebviewProvider(
-      context.extensionUri,
-      controller.getStorage(),
-      controller.getReplayEngine(),
-      controller.getReconstruction(),
-      checkpointSvcPlaceholder as unknown as import('./checkpoints/checkpointService').CheckpointService,
-      controller.getProject(),
-      () => controller!.getSessions(),
-      () => controller!.isCurrentlyRecording(),
-      () => controller!.startRecording(),
-      () => controller!.stopRecording(),
-    );
-    controller.setWebviewProvider(webviewProvider);
-
-    context.subscriptions.push(
-      vscode.window.registerWebviewViewProvider(
-        TimelineWebviewProvider.viewType,
-        webviewProvider,
-      ),
-    );
-
-    registerCommands(context, controller);
-
-    context.subscriptions.push(controller);
-
-    await controller.initialize();
-
-    console.log('[Parallax] Extension activated');
-  } catch (err) {
-    console.error('[Parallax] Activation failed:', err);
+function registerGlobal(context:vscode.ExtensionContext):void{if(globalsRegistered)return;globalsRegistered=true;
+ context.subscriptions.push(vscode.commands.registerCommand('parallax.startRecording',()=>setRecording(true)),vscode.commands.registerCommand('parallax.stopRecording',()=>setRecording(false)),vscode.commands.registerCommand('parallax.openTimeline',()=>vscode.commands.executeCommand('parallax.timeline.focus')));
+ context.subscriptions.push(vscode.workspace.registerTextDocumentContentProvider('parallax-history',{provideTextDocumentContent:async uri=>{let request:{sessionId?:unknown;sequence?:unknown;path?:unknown};try{request=JSON.parse(uri.query) as typeof request;}catch{throw new Error('Invalid historical document request');}if(!store||typeof request.sessionId!=='string'||typeof request.sequence!=='number'||!Number.isSafeInteger(request.sequence)||typeof request.path!=='string'||request.path.length>4096)throw new Error('Historical content is unavailable');if(!(await store.sessions()).some(item=>item.id===request.sessionId))throw new Error('Historical session is no longer available');const content=await reconstructAt(store,request.sessionId,request.sequence,request.path);if(content===undefined)throw new Error('No recorded file content exists at this historical point');return content;}}));
+ context.subscriptions.push(vscode.commands.registerCommand('parallax.createCheckpoint',async()=>{const name=await vscode.window.showInputBox({prompt:'Checkpoint name',validateInput:v=>v.trim()?undefined:'Enter a name'});if(name&&store&&session&&recording){try{await flushPending();await schedule(async()=>{if(!store||!session||!recording)throw new Error('Recording stopped before checkpoint creation');const point=seq;await writeSnapshot(session.id,point);const c=await store.checkpoint(session.id,name.trim(),point);await record({kind:'checkpoint',name:c.name});});vscode.window.showInformationMessage(`Checkpoint “${name.trim()}” created`);}catch(error){vscode.window.showErrorMessage(`Could not create checkpoint: ${String(error)}`);}}}));
+ context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e=>{if(e.affectsConfiguration('parallax'))configureTimers();if(e.affectsConfiguration('parallax.recordingEnabled'))void setRecording(vscode.workspace.getConfiguration('parallax').get<boolean>('recordingEnabled',true));}));
+ provider=new TimelineProvider(context);context.subscriptions.push(vscode.window.registerWebviewViewProvider('parallax.timeline',provider));
+ context.subscriptions.push({dispose:()=>{for(const resource of workspaceResources.splice(0).reverse())resource.dispose();if(timer)clearInterval(timer);if(snapshotTimer)clearInterval(snapshotTimer);}});
+}
+function contextStoragePath():string{return activeContext?.globalStorageUri.fsPath??'';}
+async function reconfigureWorkspace(context:vscode.ExtensionContext):Promise<void>{await setRecording(false);await sessionReady;await flushPending();for(const item of workspaceResources.splice(0).reverse())item.dispose();for(const item of pending.values())clearTimeout(item.timer);pending.clear();lastHash.clear();session=undefined;store=undefined;viewedSessionId=undefined;recording=false;sessionReady=Promise.resolve();if(!shuttingDown&&!deactivated)initializeWorkspace(context);if(store)await provider?.refresh();else provider?.sendEmptyState();}
+function initializeWorkspace(context:vscode.ExtensionContext):void {
+ const generation=++workspaceGeneration;const roots=vscode.workspace.workspaceFolders; if(!roots?.length) return;
+ const stableRoots=[...roots].sort((a,b)=>a.uri.toString().localeCompare(b.uri.toString()));const identity=stableRoots.length===1?stableRoots[0]!.uri.toString():stableRoots.map(f=>f.uri.toString()).join('\n');const workspaceId=hashContent(identity);store=new HistoryStore(path.join(context.globalStorageUri.fsPath,workspaceId),workspaceId);
+  recording=vscode.workspace.getConfiguration('parallax').get<boolean>('recordingEnabled',true); if(recording) sessionReady=beginSession().catch(error=>{recording=false;console.error('Parallax could not start recording in this workspace',error);vscode.window.showWarningMessage(String(error));});
+ for(const root of roots){const watcher=vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(root,'**/*'));watcher.onDidCreate(uri=>queueFile(uri,'create'));watcher.onDidChange(uri=>queueFile(uri,'modify'));watcher.onDidDelete(uri=>{lastHash.delete(relative(uri));queueFile(uri,'delete');});workspaceResources.push(watcher);}
+ workspaceResources.push(vscode.workspace.onDidRenameFiles(e=>{if(baselineInProgress)baselineChanged=true;void sessionReady.then(()=>{if(!stopping)handleRenames(e.files);}).catch(error=>console.error('Parallax rename capture failed',error));}));
+ workspaceResources.push(vscode.workspace.onDidSaveTextDocument(d=>{if(baselineInProgress)baselineChanged=true;void sessionReady.then(()=>{if(!stopping&&d.uri.scheme==='file')enqueue(()=>capture(d.uri,'save'));}).catch(error=>console.error('Parallax save capture failed',error));}));
+ configureTimers();
+ workspaceResources.push({dispose:()=>{if(timer)clearInterval(timer);if(snapshotTimer)clearInterval(snapshotTimer);}});
+ installGit(context,roots[0]!,generation);
+}
+function installGit(_context:vscode.ExtensionContext,_workspaceRoot:vscode.WorkspaceFolder,generation:number):void{const extension=vscode.extensions.getExtension<unknown>('vscode.git');if(!extension)return;void extension.activate().then(async exports=>{await sessionReady;if(deactivated||generation!==workspaceGeneration)return;const getApi=exports&&typeof exports==='object'?(exports as {getAPI?:unknown}).getAPI:undefined;if(typeof getApi!=='function')return;const api=asGitApi((getApi as (this:unknown,version:number)=>unknown).call(exports,1));if(!api)return;const observer=new GitAwareness(api,transition=>{if(stopping||deactivated)return;const repository=relative(vscode.Uri.file(transition.repository));enqueue(()=>record({kind:transition.kind,metadata:{repository,previousCommit:transition.previousCommit??'',commit:transition.commit??'',previousRef:transition.previousRef??'',ref:transition.ref??''}}));});if(deactivated||generation!==workspaceGeneration){observer.dispose();return;}workspaceResources.push({dispose:()=>observer.dispose()});}).then(undefined,(error:unknown)=>console.warn('Parallax Git API unavailable',error));}
+function handleRenames(files:readonly {oldUri:vscode.Uri;newUri:vscode.Uri}[]):void{const patterns=vscode.workspace.getConfiguration('parallax').get<string[]>('excludePatterns',[]);for(const file of files){const oldPath=relative(file.oldUri),newPath=relative(file.newUri),decision=visibleRename(historyLocation(oldPath)?.relative??oldPath,historyLocation(newPath)?.relative??newPath,patterns);if(!decision){enqueue(async()=>{lastHash.delete(oldPath);});continue;}if(decision.kind==='rename')enqueue(async()=>{const hash=lastHash.get(oldPath);lastHash.delete(oldPath);if(hash)lastHash.set(newPath,hash);await record({kind:'rename',path:newPath,oldPath});});else if(decision.kind==='delete')enqueue(async()=>{lastHash.delete(oldPath);await record({kind:'delete',path:oldPath});});else enqueue(async()=>{lastHash.delete(oldPath);await capture(file.newUri,'create',newPath);});}}
+function relative(uri:vscode.Uri):string { const root=vscode.workspace.getWorkspaceFolder(uri);if(!root)return'';const roots=vscode.workspace.workspaceFolders??[];const prefix=roots.length>1?`@${hashContent(root.uri.toString()).slice(0,12)}/`:'';return prefix+path.relative(root.uri.fsPath,uri.fsPath).replace(/\\/g,'/'); }
+function historyLocation(historyPath:string):{folder:vscode.WorkspaceFolder;relative:string}|undefined{const roots=vscode.workspace.workspaceFolders??[];if(historyPath.startsWith('@')){const slash=historyPath.indexOf('/');if(slash<0)return;const key=historyPath.slice(1,slash),folder=roots.find(r=>hashContent(r.uri.toString()).slice(0,12)===key);return folder?{folder,relative:historyPath.slice(slash+1)}:undefined;}const folder=roots[0];return folder?{folder,relative:historyPath}:undefined;}
+async function beginSession():Promise<void>{
+ if(!store)return;baselineInProgress=true;baselineChanged=false;
+ try{await store.acquireWriterLease();
+  seq=0;session=await store.startSession();viewedSessionId=session.id;await record({kind:'session-start'});
+  const roots=vscode.workspace.workspaceFolders??[],patterns=vscode.workspace.getConfiguration('parallax').get<string[]>('excludePatterns',[]),inventory={files:{} as Record<string,string>,omittedPaths:[] as string[],omissionsTruncated:false,complete:true};
+  for(const root of roots){
+   if(root.uri.scheme!=='file'){inventory.complete=false;continue;}
+   const part=await inventoryWorkspace(root.uri.fsPath,patterns,{excludedStoragePath:contextStoragePath()});
+   for(const [name,hash] of Object.entries(part.files)){
+    const key=roots.length>1?`@${hashContent(root.uri.toString()).slice(0,12)}/${name}`:name;inventory.files[key]=hash;
+    const content=part.contents[name];if(content!==undefined)await store.storeContent(content);lastHash.set(key,hash);
+   }
+   for(const omitted of part.omittedPaths)if(inventory.omittedPaths.length<500)inventory.omittedPaths.push(roots.length>1?('@'+hashContent(root.uri.toString()).slice(0,12)+'/'+omitted):omitted);else inventory.omissionsTruncated=true;inventory.omissionsTruncated=inventory.omissionsTruncated||part.omissionsTruncated;inventory.complete=inventory.complete&&part.complete;
   }
+  inventory.complete=inventory.complete&&!baselineChanged;baselineInProgress=false;
+  await record({kind:'workspace-baseline',metadata:{files:String(Object.keys(inventory.files).length),complete:String(inventory.complete)}});
+  await store.snapshot(session.id,seq,inventory.files,inventory.complete,inventory.omittedPaths,inventory.omissionsTruncated);
+ }catch(error){baselineInProgress=false;await store.releaseWriterLease();throw error;}
 }
+async function shutdown():Promise<void>{ shuttingDown=true;try{await workspaceTransitions.drain();deactivated=true;stopping=true;await recordingTransitions.drain();await sessionReady;await flushPending();recording=false;await Promise.all([...inFlight]);if(session&&store){await record({kind:'session-end'});await store.endSession(session);session=undefined;}await store?.releaseWriterLease();for(const resource of workspaceResources.splice(0).reverse())resource.dispose();if(timer)clearInterval(timer);if(snapshotTimer)clearInterval(snapshotTimer);}finally{stopping=false;} }
+async function processPending(uri:vscode.Uri,kind:'create'|'modify'|'delete',historyPath:string):Promise<void>{if(kind==='delete'){await record({kind,path:historyPath});return;}await capture(uri,kind,historyPath);}
+async function flushPending():Promise<void>{ for(const [key,item] of pending){clearTimeout(item.timer);pending.delete(key);enqueue(()=>processPending(item.uri,item.kind,item.historyPath));}await eventPipeline; }
+function setRecording(value:boolean):Promise<void>{return recordingTransitions.run(()=>applyRecordingState(value));}
+async function applyRecordingState(value:boolean):Promise<void>{if(stopping||deactivated)return;if(!value&&recording){stopping=true;try{await sessionReady;await flushPending();recording=false;await Promise.all([...inFlight]);if(session&&store){await record({kind:'session-end'});await store.endSession(session);session=undefined;}await store?.releaseWriterLease();}finally{stopping=false;}}else recording=value;vscode.window.showInformationMessage(`Parallax recording ${value?'started':'stopped'}.`);if(value){await sessionReady;if(!session){sessionReady=beginSession();try{await sessionReady;}catch(error){recording=false;await store?.releaseWriterLease();throw error;}}}}
+function configureTimers():void { if(timer)clearInterval(timer); if(snapshotTimer)clearInterval(snapshotTimer); const c=vscode.workspace.getConfiguration('parallax'); const interval=Math.max(1,c.get<number>('snapshotIntervalMinutes',30)); snapshotTimer=setInterval(()=>{if(recording)void schedule(createSnapshot).catch(error=>console.error('Parallax snapshot failed',error));},interval*60000); }
+function queueFile(uri:vscode.Uri,kind:'create'|'modify'|'delete'):void { if(baselineInProgress)baselineChanged=true;if(stopping||!recording||!store||!session)return; const rel=relative(uri); const patterns=vscode.workspace.getConfiguration('parallax').get<string[]>('excludePatterns',[]); if(!rel||isExcluded(historyLocation(rel)?.relative??rel,patterns))return; const old=pending.get(rel); if(old)clearTimeout(old.timer); const ms=Math.max(0,vscode.workspace.getConfiguration('parallax').get<number>('debounceMs',1000)); const entry={uri,kind,historyPath:rel,timer:setTimeout(()=>{pending.delete(rel);void sessionReady.then(()=>enqueue(()=>processPending(uri,kind,rel))).catch(error=>console.error('Parallax delayed capture failed',error));},ms)};pending.set(rel,entry); }
+function insidePath(root:string,target:string):boolean{const relativePath=path.relative(root,target);return relativePath===''||(!relativePath.startsWith(`..${path.sep}`)&&relativePath!=='..'&&!path.isAbsolute(relativePath));}
+async function safeWorkspaceRead(uri:vscode.Uri):Promise<Buffer>{if(uri.scheme!=='file')throw new Error('Only local workspace files are recorded');const folder=vscode.workspace.getWorkspaceFolder(uri);if(!folder||folder.uri.scheme!=='file')throw new Error('File is outside a local workspace root');const root=await fs.realpath(folder.uri.fsPath),relativePath=path.relative(folder.uri.fsPath,uri.fsPath);if(!insidePath(folder.uri.fsPath,uri.fsPath))throw new Error('File is outside its workspace root');let cursor=folder.uri.fsPath;for(const part of relativePath.split(path.sep).filter(Boolean)){cursor=path.join(cursor,part);const stat=await fs.lstat(cursor);if(stat.isSymbolicLink())throw new Error('Refusing to record a symbolic link');}const actual=await fs.realpath(uri.fsPath);if(!insidePath(root,actual))throw new Error('File resolves outside its workspace root');const flags=fsConstants.O_RDONLY|(fsConstants.O_NOFOLLOW??0),handle=await fs.open(actual,flags);try{const stat=await handle.stat();if(!stat.isFile())throw new Error('Only regular files are recorded');const bytes=await handle.readFile(),after=await fs.realpath(uri.fsPath);if(after!==actual||!insidePath(root,after))throw new Error('File path changed during recording');return bytes;}finally{await handle.close();}}
+async function capture(uri:vscode.Uri,kind:'create'|'modify'|'save',recordedPath?:string):Promise<void>{ if(!recording||!store||!session)return; const rel=recordedPath??relative(uri); if(!rel||isExcluded(historyLocation(rel)?.relative??rel,vscode.workspace.getConfiguration('parallax').get<string[]>('excludePatterns',[])))return; try { const bytes=await safeWorkspaceRead(uri); if(!isSupportedText(bytes))return; const text=new TextDecoder('utf-8',{fatal:true}).decode(bytes); const hash=hashContent(text); if(lastHash.get(rel)===hash)return; const previousHash=lastHash.get(rel); const stored=await store.storeContent(text); lastHash.set(rel,stored); await record({kind:previousHash?'modify':kind,path:rel,contentHash:stored,previousHash}); } catch(e){ console.error('Parallax file capture failed',e); } }
+async function record(input:Pick<HistoryEvent,'kind'|'path'|'oldPath'|'contentHash'|'previousHash'|'name'|'metadata'>):Promise<void>{ if(!store||!session)return; const event:HistoryEvent={schemaVersion:1,id:randomUUID(),workspaceId:session.workspaceId,sessionId:session.id,sequence:++seq,timestamp:Date.now(),...input}; await store.append(event,vscode.workspace.getConfiguration('parallax').get<number>('maxEventsPerSession',10000)); }
+async function writeSnapshot(sessionId:string,sequence:number):Promise<void>{
+ if(!store)throw new Error('History storage is unavailable');
+ const snapshots=await store.snapshots(sessionId),baseline=[...snapshots].filter(s=>s.sequence<=sequence).sort((a,b)=>b.sequence-a.sequence)[0],start=baseline?.sequence??0;
+ const remaining=await store.eventsBetween(sessionId,start,sequence);let expected=start+1;
+ for(const event of remaining){if(event.sequence!==expected++)throw new Error(`Cannot snapshot incomplete history at sequence ${expected-1}`);}
+ const newest=(await store.eventPage(sessionId,Number.MAX_SAFE_INTEGER,1))[0];if(sequence>Math.max(start,newest?.sequence??0))throw new Error(`Cannot snapshot beyond available history at sequence ${sequence}`);
+ const files=Object.fromEntries(replayContentReferences(remaining,sequence,baseline?.files,start));for(const hash of Object.values(files))await store.getContent(hash);
+ await store.snapshot(sessionId,sequence,files,baseline?.inventoryComplete===true,baseline?.omittedPaths,baseline?.omissionsTruncated);
+}
+async function createSnapshot():Promise<void>{if(!recording||!store||!session)return;const snapshotSession=session.id,sequence=seq;await writeSnapshot(snapshotSession,sequence);if(session?.id===snapshotSession)await record({kind:'snapshot'});}
 
-export async function deactivate(): Promise<void> {
-  try {
-    await controller?.stopRecording();
-  } catch {
-    // Ignore deactivation errors
+class TimelineProvider implements vscode.WebviewViewProvider {
+ private historyGeneration=0;
+ sendEmptyState():void{this.historyGeneration++;this.view?.webview.postMessage({type:'history',events:[],hasMore:false,checkpoints:[],sessions:[],viewedSessionId:undefined,activeSessionId:undefined,recording:false});}
+ refresh():Promise<void>{return this.sendHistory();}
+ private view?:vscode.WebviewView;
+ private viewSubscription?:vscode.Disposable;
+ constructor(private readonly context:vscode.ExtensionContext){}
+ resolveWebviewView(view:vscode.WebviewView):void { this.viewSubscription?.dispose();this.view=view; view.webview.options={enableScripts:true,localResourceRoots:[vscode.Uri.joinPath(this.context.extensionUri,'media')]}; const nonce=randomUUID().replace(/-/g,''); const script=view.webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri,'media','main.js')); const style=view.webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri,'media','style.css')); view.webview.html=`<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}'; style-src ${view.webview.cspSource};"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="${style}"></head><body><div id="root"></div><script nonce="${nonce}" src="${script}"></script></body></html>`; this.viewSubscription=view.webview.onDidReceiveMessage(m=>void this.message(m).catch(error=>{const request=m&&typeof m==='object'?m as Record<string,unknown>:undefined;this.view?.webview.postMessage({type:'error',...(typeof request?.sessionId==='string'?{sessionId:request.sessionId}:{}),message:String(error)});}));view.onDidDispose(()=>{this.viewSubscription?.dispose();this.viewSubscription=undefined;if(this.view===view)this.view=undefined;}); void this.sendHistory().catch(error=>view.webview.postMessage({type:'error',message:String(error)})); }
+ private async message(m:unknown):Promise<void>{
+  if(!isWebviewMessage(m))return;
+  const value=m,type=value.type;
+  if(type==='refresh'){await this.sendHistory();return;}
+  if(type==='open-settings'){await vscode.commands.executeCommand('workbench.action.openSettings','@ext:parallax-dev.parallax');return;}
+  if(type==='recording'&&typeof value.enabled==='boolean'){await setRecording(value.enabled);await this.sendHistory();return;}
+  if(type==='open-session'&&typeof value.sessionId==='string'&&store){const currentStore=store,sessions=await currentStore.sessions();if(store===currentStore&&sessions.some(s=>s.id===value.sessionId)){viewedSessionId=value.sessionId;await this.sendHistory();}return;}
+  if(type==='open-checkpoint'&&typeof value.checkpointId==='string'&&typeof value.requestId==='number'&&store){const currentStore=store,checkpoints=await currentStore.checkpoints(),checkpoint=checkpoints.find(c=>c.id===value.checkpointId);if(!checkpoint||store!==currentStore)return;viewedSessionId=checkpoint.sessionId;await this.sendHistory();if(store!==currentStore||viewedSessionId!==checkpoint.sessionId)return;const snapshot=[...(await currentStore.snapshots(checkpoint.sessionId))].filter(s=>s.sequence<=checkpoint.sequence).sort((a,b)=>b.sequence-a.sequence)[0];this.view?.webview.postMessage({type:'checkpoint-files',requestId:value.requestId,sessionId:checkpoint.sessionId,sequence:checkpoint.sequence,files:snapshot?Object.keys(snapshot.files):[]});this.view?.webview.postMessage({type:'select-sequence',requestId:value.requestId,sessionId:checkpoint.sessionId,sequence:checkpoint.sequence});return;}
+  if((type==='open-history'||type==='inspect'||type==='restore'||type==='restore-workspace'||type==='compare'||type==='load-older')&&typeof value.sessionId==='string'&&store&&viewedSessionId===value.sessionId){
+   const currentStore=store,requestSession=value.sessionId;
+   const stillCurrent=():boolean=>store===currentStore&&viewedSessionId===requestSession;
+   if(type==='load-older'&&typeof value.beforeSequence==='number'){const page=await currentStore.eventPage(requestSession,value.beforeSequence,100);if(stillCurrent())this.view?.webview.postMessage({type:'older-events',sessionId:requestSession,events:page,hasMore:page.length===100});return;}
+   if(type==='open-history'&&typeof value.sequence==='number'&&typeof value.path==='string'){const uri=vscode.Uri.from({scheme:'parallax-history',path:`/${value.sequence}/${path.posix.basename(value.path)}`,query:JSON.stringify({sessionId:requestSession,sequence:value.sequence,path:value.path})});const document=await vscode.workspace.openTextDocument(uri);if(stillCurrent())await vscode.window.showTextDocument(document,{preview:false});return;}
+   if((type==='inspect'||type==='restore')&&typeof value.sequence==='number'&&typeof value.path==='string'){try{const events=await currentStore.eventsBetween(requestSession,Math.max(0,value.sequence-1),value.sequence),content=await reconstructAt(currentStore,requestSession,value.sequence,value.path);if(!stillCurrent())return;if(type==='inspect')this.view?.webview.postMessage({type:'content',sessionId:requestSession,sequence:value.sequence,path:value.path,content:content??'(No recorded content at this point)'});else await this.restore(value.path,content,events,value.sequence);}catch(error){if(stillCurrent())this.view?.webview.postMessage({type:'error',sessionId:requestSession,message:String(error)});}return;}
+   if(type==='restore-workspace'&&typeof value.sequence==='number'){try{const latest=(await currentStore.eventPage(requestSession,Number.MAX_SAFE_INTEGER,1))[0],events=latest?await currentStore.eventsBetween(requestSession,value.sequence,latest.sequence):[];if(stillCurrent())await this.restoreWorkspaceAt(events,value.sequence);}catch(error){if(stillCurrent())this.view?.webview.postMessage({type:'error',sessionId:requestSession,message:String(error)});}return;}
+   if(type==='compare'&&typeof value.sequence==='number'&&typeof value.baseSequence==='number'&&typeof value.path==='string'){try{const [before,after,checkpoints,baseEvents,selectedEvents]=await Promise.all([reconstructAt(currentStore,requestSession,value.baseSequence,value.path),reconstructAt(currentStore,requestSession,value.sequence,value.path),currentStore.checkpoints(),currentStore.eventsBetween(requestSession,value.baseSequence-1,value.baseSequence),currentStore.eventsBetween(requestSession,value.sequence-1,value.sequence)]);if(!stillCurrent())return;const baseTimestamp=baseEvents.find(e=>e.sequence===value.baseSequence)?.timestamp??checkpoints.find(c=>c.sessionId===requestSession&&c.sequence===value.baseSequence)?.timestamp??0,timestamp=selectedEvents.find(e=>e.sequence===value.sequence)?.timestamp??checkpoints.find(c=>c.sessionId===requestSession&&c.sequence===value.sequence)?.timestamp??0;this.view?.webview.postMessage({type:'comparison',sessionId:requestSession,before:before??'',after:after??'',diff:compareText(before??'',after??'',value.path),path:value.path,baseSequence:value.baseSequence,sequence:value.sequence,baseTimestamp,timestamp});}catch(error){if(stillCurrent())this.view?.webview.postMessage({type:'error',sessionId:requestSession,message:String(error)});}return;}
   }
+ }
+ private async restore(historyPath:string,historical:string|undefined,events:HistoryEvent[],sequence:number):Promise<void>{if(historical===undefined&&!events.some(e=>e.sequence<=sequence&&(e.path===historyPath||e.oldPath===historyPath)))throw new Error('This file has no recorded history at the selected point');if(!store||!session||!recording){this.view?.webview.postMessage({type:'error',message:'Start recording before restoring so the current content can be preserved in history.'});return;}const location=historyLocation(historyPath);if(!location)throw new Error('The file belongs to a workspace folder that is not currently open');const {folder,relative:relativePath}=location;if(folder.uri.scheme!=='file')throw new Error('Restore is available only for local file-system workspace folders');if(isExcluded(relativePath,vscode.workspace.getConfiguration('parallax').get<string[]>('excludePatterns',[])))throw new Error('Excluded files cannot be restored');const uri=vscode.Uri.joinPath(folder.uri,...relativePath.split('/'));let current:string|undefined;try{const bytes=vscode.workspace.fs.readFile(uri);const buffer=Buffer.from(await bytes);if(!isSupportedText(buffer))throw new Error('Only supported text files can be restored');current=new TextDecoder('utf-8',{fatal:true}).decode(buffer);}catch(e){if(!(e instanceof vscode.FileSystemError)||e.code!=='FileNotFound')throw e;}const currentHash=current===undefined?undefined:hashContent(current);const target=historical;const preview=compareText(current??'',target??'',relativePath);const document=await vscode.workspace.openTextDocument({language:'diff',content:`Restore preview: ${relativePath}\nHistorical point: ${sequence}\nAdded ${preview.added}, removed ${preview.removed}\n\n${preview.patch}`});await vscode.window.showTextDocument(document,{preview:true});const confirm=await vscode.window.showWarningMessage(`Restore ${relativePath} to the selected historical version? The current version will be recorded first.`,{modal:true},'Restore');if(confirm!=='Restore')return;await schedule(async()=>{if(!store)throw new Error('History storage is unavailable');let live:string|undefined;try{const bytes=Buffer.from(await vscode.workspace.fs.readFile(uri));if(!isSupportedText(bytes))throw new Error('Only supported text files can be restored');live=new TextDecoder('utf-8',{fatal:true}).decode(bytes);}catch(error){if(!(error instanceof vscode.FileSystemError)||error.code!=='FileNotFound')throw error;}const liveHash=live===undefined?undefined:hashContent(live);if(liveHash!==currentHash)throw new Error('Workspace file changed after the restore preview; refresh and try again');if(live!==undefined){const backupHash=await store.storeContent(live);await record({kind:'save',path:historyPath,contentHash:backupHash});}await restoreFile(folder.uri.fsPath,relativePath,currentHash,target);if(target===undefined){lastHash.delete(historyPath);await record({kind:'delete',path:historyPath});}else{const hash=await store.storeContent(target);lastHash.set(historyPath,hash);await record({kind:'modify',path:historyPath,contentHash:hash,previousHash:currentHash});}});this.view?.webview.postMessage({type:'restore-result',message:`Restored ${relativePath}`});}
+ private async restoreWorkspaceAt(events:HistoryEvent[],sequence:number):Promise<void>{
+  if(!store||!session||!recording)throw new Error('Start recording before restoring so current files can be preserved.');
+  const snapshots=await store.snapshots(viewedSessionId??session.id),baseline=[...snapshots].filter(s=>s.sequence<=sequence&&s.inventoryComplete===true).sort((a,b)=>b.sequence-a.sequence)[0];if(!baseline)throw new Error('Full-workspace restore requires a valid complete inventory snapshot at or before this point.');const refs=await reconstructWorkspaceAt(store,viewedSessionId??session.id,sequence),paths=new Set<string>([...refs.keys(),...events.flatMap(e=>[e.path,e.oldPath].filter((p):p is string=>!!p))]);
+  const patterns=vscode.workspace.getConfiguration('parallax').get<string[]>('excludePatterns',[]),groups=new Map<string,{root:string;entries:WorkspaceRestoreEntry[];historyPaths:string[];current:(string|undefined)[]}>(),previews:string[]=[],omitted:string[]=[...(baseline.omittedPaths??[])];if(baseline.omissionsTruncated)omitted.push('Additional unsupported or unsafe paths were omitted from this preview.');
+  for(const historyPath of [...paths].sort()){
+   const location=historyLocation(historyPath);if(!location||location.folder.uri.scheme!=='file'){omitted.push(historyPath);continue;}const {folder,relative:rel}=location;if(isExcluded(rel,patterns)){omitted.push(`${historyPath} (excluded)`);continue;}
+   const uri=vscode.Uri.joinPath(folder.uri,...rel.split('/'));let current:string|undefined;
+   try{const bytes=Buffer.from(await vscode.workspace.fs.readFile(uri));if(!isSupportedText(bytes))throw new Error(`Unsupported file blocks workspace restore: ${historyPath}`);current=new TextDecoder('utf-8',{fatal:true}).decode(bytes);}
+   catch(error){if(!(error instanceof vscode.FileSystemError)||error.code!=='FileNotFound')throw error;}
+   const targetHash=refs.get(historyPath),historical=targetHash?await store.getContent(targetHash):undefined,currentHash=current===undefined?undefined:hashContent(current);if(currentHash===targetHash)continue;
+   const group=groups.get(folder.uri.fsPath)??{root:folder.uri.fsPath,entries:[],historyPaths:[],current:[]};group.entries.push({path:rel,expectedCurrentHash:currentHash,historicalContent:historical});group.historyPaths.push(historyPath);group.current.push(current);groups.set(folder.uri.fsPath,group);
+   previews.push(`${currentHash===undefined?'+':historical===undefined?'-':'~'} ${historyPath}\n${compareText(current??'',historical??'',rel).patch}`);
+  }
+  const planned=[...groups.values()];const count=planned.reduce((n,g)=>n+g.entries.length,0);if(!count){vscode.window.showInformationMessage('No eligible file changes to restore.');return;}
+  const document=await vscode.workspace.openTextDocument({language:'diff',content:`Restore recorded files preview at sequence ${sequence}\n${count} file(s) will change. Only files observed in Parallax history are managed; other workspace files remain untouched.\n${omitted.length?`\nUnavailable or excluded paths left untouched:\n${omitted.join('\n')}\n`:''}\n${previews.join('\n\n')}`});await vscode.window.showTextDocument(document,{preview:true});
+  const confirmation=await vscode.window.showWarningMessage(`Restore ${count} recorded text files? Unrecorded and excluded files remain untouched. Current contents will be recorded first.`,{modal:true},'Restore Recorded Files');if(confirmation!=='Restore Recorded Files')return;
+  await schedule(async()=>{
+   if(!store)throw new Error('History storage is unavailable');for(const group of planned)for(let i=0;i<group.entries.length;i++){const content=group.current[i];if(content!==undefined){const hash=await store.storeContent(content);await record({kind:'save',path:group.historyPaths[i],contentHash:hash});}}
+   const applied:{group:typeof planned[number];entries:WorkspaceRestoreEntry[]}[]=[];
+   try{for(const group of planned){await restoreWorkspace(group.root,group.entries);applied.push({group,entries:group.entries});}}
+   catch(error){for(const item of applied.reverse()){const inverse=item.group.entries.map((entry,i)=>({path:entry.path,expectedCurrentHash:entry.historicalContent===undefined?undefined:hashContent(entry.historicalContent),historicalContent:item.group.current[i]}));await restoreWorkspace(item.group.root,inverse).catch(rollback=>{throw new Error(`Restore failed and rollback was incomplete: ${String(rollback)}; original error: ${String(error)}`);});}throw error;}
+   for(const group of planned)for(let i=0;i<group.entries.length;i++){const item=group.entries[i]!,historyPath=group.historyPaths[i];if(item.historicalContent===undefined){lastHash.delete(historyPath);await record({kind:'delete',path:historyPath});}else{const hash=await store.storeContent(item.historicalContent);lastHash.set(historyPath,hash);await record({kind:'modify',path:historyPath,contentHash:hash,previousHash:item.expectedCurrentHash});}}
+   this.view?.webview.postMessage({type:'restore-result',message:`Restored ${count} files.`});
+  });
+ }
+ private async sendHistory():Promise<void>{const generation=++this.historyGeneration;await sessionReady;const currentStore=store;if(!currentStore)return;const sessions=await currentStore.sessions();if(!viewedSessionId)viewedSessionId=sessions[0]?.id;const currentSession=viewedSessionId,[events,checkpoints]=await Promise.all([currentSession?currentStore.eventPage(currentSession,Number.MAX_SAFE_INTEGER,100):Promise.resolve([]),currentStore.checkpoints()]);if(generation!==this.historyGeneration||store!==currentStore||viewedSessionId!==currentSession)return;const roots=vscode.workspace.workspaceFolders??[],projectName=vscode.workspace.name||(roots.length===1?roots[0]!.name:`${roots.length} folders`);this.view?.webview.postMessage({type:'history',events,hasMore:events.length===100,checkpoints:checkpoints.filter(c=>c.sessionId===currentSession),sessions,viewedSessionId:currentSession,activeSessionId:session?.id,recording,projectName}); }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Derive a stable project ID from the workspace root path.
- * Uses a hash of the absolute path so the ID is stable across restarts.
- */
-function deriveProjectId(workspaceRoot: string): string {
-  const crypto = require('crypto') as typeof import('crypto');
-  return crypto
-    .createHash('sha256')
-    .update(workspaceRoot.toLowerCase().replace(/\\/g, '/'))
-    .digest('hex')
-    .slice(0, 16);
-}
+export function deactivate():Promise<void> { return shutdown(); }

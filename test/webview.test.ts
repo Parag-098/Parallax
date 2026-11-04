@@ -1,0 +1,35 @@
+import * as assert from 'assert';
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import { JSDOM } from 'jsdom';
+
+describe('Parallax webview interaction',()=>{
+ it('renders history and sends session, paging, inspection, comparison, replay, checkpoint, restore, and recording requests',async()=>{
+  const dom=new JSDOM('<!doctype html><html><body><div id="root"></div></body></html>',{url:'vscode-webview://test/',runScripts:'outside-only',pretendToBeVisual:true}),messages:Record<string,unknown>[]=[];
+  const {window}=dom;Object.assign(window,{acquireVsCodeApi:()=>({postMessage:(message:Record<string,unknown>)=>messages.push(message)})});
+  const script=await fs.readFile(path.join(process.cwd(),'media','main.js'),'utf8');window.eval(script);
+  const send=(data:Record<string,unknown>):void=>{window.dispatchEvent(new window.MessageEvent('message',{data}));};
+   const wait=async(predicate:()=>boolean):Promise<void>=>{const until=Date.now()+3000;while(Date.now()<until){if(predicate())return;await new Promise(resolve=>setTimeout(resolve,10));}throw new Error(`Timed out waiting for webview render; messages=${JSON.stringify(messages)}; selected=${window.document.querySelector('.event-row.selected')?.outerHTML??'none'}`);};
+  const click=(button:Element):void=>{button.dispatchEvent(new window.MouseEvent('click',{bubbles:true}));};
+  try{
+   await wait(()=>messages.some(message=>message.type==='refresh'));
+   const events=[{id:'one',sequence:1,timestamp:1000,kind:'create',path:'src/a.ts'},{id:'two',sequence:2,timestamp:2000,kind:'modify',path:'src/a.ts'}];
+   send({type:'history',events,hasMore:true,sessions:[{id:'s1',startedAt:1000},{id:'s2',startedAt:500}],checkpoints:[{id:'cp',name:'before fix',sequence:1,timestamp:1000}],viewedSessionId:'s1',activeSessionId:'s1',recording:true});
+   await wait(()=>window.document.querySelectorAll('.event-row').length===2);assert.match(window.document.body.textContent??'',/Recording/);assert.match(window.document.body.textContent??'',/HISTORICAL VERSION/);
+   click(window.document.querySelector('.settings-button')!);assert.ok(messages.some(message=>message.type==='open-settings'));
+   const selected=window.document.querySelector('.event-row.selected');assert.ok(selected);await wait(()=>messages.some(m=>m.type==='inspect'&&m.sequence===2));
+   send({type:'content',sessionId:'s1',sequence:2,path:'src/a.ts',content:'new contents'});await wait(()=>window.document.body.textContent?.includes('new contents')===true);
+   const compareSelect=window.document.querySelector('.compare-field select') as HTMLSelectElement;compareSelect.value='1';compareSelect.dispatchEvent(new window.Event('change',{bubbles:true}));click([...window.document.querySelectorAll('button')].find(button=>button.textContent==='Compare')!);await wait(()=>messages.some(m=>m.type==='compare'&&m.baseSequence===1&&m.sequence===2));
+   send({type:'comparison',sessionId:'s1',before:'old',after:'new',diff:{patch:'-old\n+new',added:1,removed:1},baseTimestamp:1000,timestamp:2000,baseSequence:1,sequence:2,path:'src/a.ts'});await wait(()=>window.document.body.textContent?.includes('Historical comparison')===true);
+   click(window.document.querySelector('[aria-label="Previous event"]')!);await wait(()=>messages.some(m=>m.type==='inspect'&&m.sequence===1));click(window.document.querySelector('[aria-label="Next event"]')!);await wait(()=>messages.filter(m=>m.type==='inspect'&&m.sequence===2).length>1);
+   click([...window.document.querySelectorAll('button')].find(button=>button.textContent==='Open in Editor')!);assert.ok(messages.some(m=>m.type==='open-history'&&m.sessionId==='s1'&&m.sequence===2&&m.path==='src/a.ts'));
+   click([...window.document.querySelectorAll('button')].find(button=>button.textContent?.includes('Load older events'))!);assert.ok(messages.some(m=>m.type==='load-older'&&m.sessionId==='s1'&&m.beforeSequence===1));send({type:'older-events',sessionId:'s1',events:[{id:'zero',sequence:0,timestamp:0,kind:'session-start'}],hasMore:false});await wait(()=>window.document.querySelectorAll('.event-row').length===3);click(window.document.getElementById('event-zero')!);await wait(()=>window.document.querySelector('.code-view')?.textContent?.includes('no recorded file contents')===true);
+   const selects=[...window.document.querySelectorAll('select')],sessionSelect=selects[0]!;Object.defineProperty(sessionSelect,'value',{value:'s2',writable:true});sessionSelect.dispatchEvent(new window.Event('change',{bubbles:true}));assert.ok(messages.some(m=>m.type==='open-session'&&m.sessionId==='s2'));
+   send({type:'history',events:[{id:'other',sequence:1,timestamp:500,kind:'create',path:'other.ts'}],hasMore:false,sessions:[{id:'s1',startedAt:1000},{id:'s2',startedAt:500}],checkpoints:[{id:'cp',name:'before fix',sequence:1,timestamp:1000}],viewedSessionId:'s2',activeSessionId:'s1',recording:false});await wait(()=>window.document.body.textContent?.includes('Paused')===true);
+   send({type:'content',sessionId:'s1',sequence:1,path:'other.ts',content:'stale session content'});send({type:'older-events',sessionId:'s1',events:[{id:'stale',sequence:0,timestamp:0,kind:'modify',path:'wrong.ts'}],hasMore:false});await new Promise(resolve=>setTimeout(resolve,30));assert.ok(!window.document.body.textContent?.includes('stale session content'));assert.strictEqual(window.document.getElementById('event-stale'),null);assert.ok(messages.some(m=>m.type==='inspect'&&m.sessionId==='s2'&&m.sequence===1));
+   const checkpointSelect=[...window.document.querySelectorAll('select')].find(select=>select.getAttribute('aria-label')==='Checkpoint')!;Object.defineProperty(checkpointSelect,'value',{value:'cp',writable:true});checkpointSelect.dispatchEvent(new window.Event('change',{bubbles:true}));const checkpointRequest=messages.find(m=>m.type==='open-checkpoint'&&m.checkpointId==='cp');assert.ok(checkpointRequest&&Number.isSafeInteger(checkpointRequest.requestId));send({type:'checkpoint-files',sessionId:'s2',requestId:Number(checkpointRequest.requestId)-1,sequence:1,files:['stale.ts']});send({type:'checkpoint-files',sessionId:'s2',requestId:checkpointRequest.requestId,sequence:1,files:['valid.ts']});await wait(()=>window.document.querySelector('[aria-label="Checkpoint file"]')?.textContent?.includes('valid.ts')===true);assert.ok(!window.document.querySelector('[aria-label="Checkpoint file"]')?.textContent?.includes('stale.ts'));
+   click([...window.document.querySelectorAll('button')].find(button=>button.textContent?.startsWith('Preview file restore'))!);assert.ok(messages.some(m=>m.type==='restore'&&m.sessionId==='s2'&&m.path==='other.ts'));click([...window.document.querySelectorAll('button')].find(button=>button.textContent?.startsWith('Preview workspace restore'))!);assert.ok(messages.some(m=>m.type==='restore-workspace'&&m.sessionId==='s2'&&m.sequence===1));
+   click(window.document.querySelector('.record-button')!);assert.ok(messages.some(m=>m.type==='recording'&&m.enabled===true));
+  }finally{dom.window.close();}
+ });
+});

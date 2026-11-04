@@ -1,19 +1,5 @@
 {
-  "compilerOptions": {
-    "module": "commonjs",
-    "target": "ES2020",
-    "lib": ["ES2020"],
-    "outDir": "./out",
-    "rootDir": "./src",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true,
-    "sourceMap": true,
-    "noImplicitReturns": true,
-    "noFallthroughCasesInSwitch": true
-  },
-  "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "out", "src/webview"]
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "rootDir": ".", "outDir": "out", "types": ["node", "mocha"] },
+  "include": ["src/**/*.ts", "test/**/*.ts"], "exclude": ["node_modules", "out"]
 }

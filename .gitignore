@@ -1,5 +1,30 @@
+# Dependencies
 node_modules/
+
+# Compiled output
 out/
+dist/
+build/
+
+# VS Code extension packaging
 *.vsix
 .vscode-test/
-coverage/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE temporary files
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json

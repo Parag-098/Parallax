@@ -1,172 +1,73 @@
 # Parallax
 
-**A local-first VS Code development time machine.**
+Parallax is a local-first VS Code extension for inspecting text-file development history. History stays under VS Code global extension storage, isolated by a hash of the workspace roots. The extension has no telemetry or cloud service.
 
-Parallax records meaningful software-development activity as you work and lets you inspect, replay, and navigate how your project evolved over time — with no backend, no cloud, no API key required.
+## License
 
----
+Parallax is licensed under the MIT License.
+See the [LICENSE](LICENSE) file for details.
 
-## What Parallax Is
+## Implemented workflows
 
-Parallax treats your development history as an **event stream** rather than a series of manually created snapshots. Every file creation, modification, deletion, save, and Git operation is recorded as a typed event with a stable ID, timestamp, and content hash. You can travel backwards and forwards through that stream, view what any file looked like at any point in time, and inspect the diffs between versions.
+- Start and stop recording from commands or the sidebar.
+- Capture text file creation, modification, deletion, saves, renames, and supported Git activity.
+- Inspect and switch between persisted sessions without changing the active recording session.
+- Navigate named checkpoints and move through a session timeline.
+- Reconstruct historical text using verified content-addressed blobs, sparse sequence indexes, and the nearest valid snapshot. Indexed reads are bounded to 64 MiB and 100,000 events per operation.
+- Compare two historical points using actual reconstructed content and line statistics.
+- Inventory eligible existing UTF-8 text files at session start (up to 5,000 files / 64 MiB total, 10 MiB per file; scanning stops after 50,000 directory entries) and fingerprint them into a baseline snapshot. A complete baseline enables preview and confirmation of historical workspace restoration, including pre-existing files and later creates, deletes, and renames. Restore reports unavailable text paths from the bounded omission list, checks conflicts before writes, captures current contents, and attempts rollback if an apply fails.
+- Capture multiple workspace roots with stable root prefixes and isolated workspace storage.
+- Reconfigure workspace storage, session, watchers, and Git observers when workspace roots change. A saved `.code-workspace` integration test exercises adding/removing roots, switching roots, final-root removal, and capture/disposal behavior. A changed root set receives a different history identity; histories are preserved under each identity and are not automatically merged. One live recording owner per workspace is coordinated with a local lease; appends verify lock ownership and stale same-machine process locks can be reclaimed.
+- Load timeline events in 100-event pages. Historical inspection and comparison seek through a sparse event index from the nearest valid snapshot. Full workspace restoration is capped by the reconstruction range safety limits.
+- Use a responsive, VS Code theme-aware timeline with keyboard replay, event details, line-aligned historical comparisons, and a read-only historical editor that keeps VS Code syntax services.
+- Open Parallax settings directly from the sidebar; settings remain owned by VS Code configuration.
 
-Think of it as a local, continuous git log for your individual edits — not just commits.
+The built-in Git extension's public API reports commits and checkouts explicitly; Parallax also records ambiguous HEAD changes as `git-head`. A HEAD transition alone is not proof of a commit operation.
 
----
+## Current limits
 
-## Phase 1 Features
+Inventory is a bounded scan of eligible UTF-8 text files; binary, excluded, oversized, inaccessible, and over-limit files are not included. A baseline that hits scan errors or limits is marked incomplete and cannot be used for full-workspace restoration. Files created while recording is stopped or otherwise unobserved remain outside history. Restore rejects existing symlinks and rechecks canonical parents before filesystem changes, but Node's path-based rename APIs cannot make validation and rename one atomic no-follow operation; a concurrent local process that swaps parent paths remains a residual TOCTOU risk. Capture and inventory reject static symlinks, open canonical paths, use O_NOFOLLOW where available, and recheck resolved targets; Windows and Node path APIs cannot eliminate every concurrent filesystem swap race. The schema marker is migrated atomically from unversioned/legacy storage; it does not transform historic event records. Indexed reconstruction fails safely if its event range exceeds 64 MiB or 100,000 events. Root changes have been exercised in a saved multi-root Extension Development Host workspace; histories remain isolated by root-set identity and are not automatically merged when roots change. Virtual workspace restore is unavailable. Binary content is not recorded. Causal Rewind, terminal/test history, cloud sync, and AI analysis remain out of scope.
 
-| Feature | Status |
-|---|---|
-| Workspace / project detection | ✅ |
-| Start / stop recording | ✅ |
-| Development sessions | ✅ |
-| File event recording (create, modify, delete, rename, save) | ✅ |
-| SHA-256 content hashing | ✅ |
-| File diffs (unified patch, lines added/removed) | ✅ |
-| Local persistent history | ✅ |
-| Snapshots (periodic + on-demand) | ✅ |
-| Historical state reconstruction | ✅ |
-| Timeline UI (VS Code webview) | ✅ |
-| Historical code viewer | ✅ |
-| Diff viewer (side-by-side) | ✅ |
-| Replay engine (step forward/back, play, scrub) | ✅ |
-| Basic Git awareness (commits, checkouts) | ✅ |
-| Named checkpoints | ✅ |
-| Configurable exclusions | ✅ |
-| Persistence across VS Code restarts | ✅ |
-| Automated tests (89 passing) | ✅ |
+## Local storage
 
----
+Data is written beneath `ExtensionContext.globalStorageUri/<workspace-hash>/`:
 
-## Local-First and Privacy
+- `session-<id>.json`: independent session metadata.
+- `events-<id>.jsonl`: ordered events.
+- `events-<id>.idx`: regenerable sparse event sequence/byte-offset index (one entry per 64 events).
+- `content/<sha256>`: deduplicated UTF-8 text blobs.
+- `checkpoint-<id>.json`: named history positions.
+- `snapshot-<session>-<sequence>.json`: fingerprinted path-to-content-reference manifests.
 
-- All data stays on your machine.
-- Nothing is uploaded anywhere.
-- History is stored in VS Code's global extension storage directory (`~/.vscode/extensions/…`).
-- No API keys, accounts, or network access of any kind.
-- History survives VS Code restarts and workspace reopening.
+Snapshots may carry `inventoryComplete`, up to 500 unsupported/symlinked relative paths, and an omission-truncated flag. Excluded paths are not persisted in this list.
 
----
+Event writes are serialized within an extension host. A local `recorder.lock` lease prevents simultaneous recording sessions for one workspace; windows can browse while another window records. Appends verify the owning token, and stale same-host process locks are reclaimed. Incomplete final JSONL records are repaired before the next append; malformed interior records fail reads. Retention creates snapshot anchors before pruning events, and checkpoint snapshots are preserved. Content blobs are not garbage collected. Storage schema metadata is upgraded atomically without rewriting v1 event/content records. Timeline pages read backward from the JSONL tail; the sparse index is rebuilt by streaming old event files when needed.
 
-## Development Setup
+Review exclusions before recording sensitive projects. Exclusions reduce recording exposure but cannot guarantee that secrets are never captured.
 
-### Prerequisites
+## Build and run
 
-- Node.js 18 or later (tested on 24)
-- VS Code 1.85 or later
-- npm
+Requirements: Node.js 18.18+ for development commands, VS Code 1.85+, and npm.
 
-### Install dependencies
-
-```bash
+```sh
 npm install
-```
-
-### Build the extension
-
-```bash
 npm run build
-```
-
-This runs two steps:
-
-1. `build:extension` — TypeScript → `out/` via `tsc`
-2. `build:webview` — React + TypeScript → `out/webview/webview.js` via webpack
-
-### Watch mode (development)
-
-```bash
-# Extension TypeScript watch
-npm run watch
-
-# Webview webpack watch (separate terminal)
-npm run watch:webview
-```
-
----
-
-## Running the VS Code Extension Development Host
-
-1. Open this repository in VS Code.
-2. Press **F5** (or **Run → Start Debugging**).
-3. A new VS Code window opens with Parallax installed.
-4. Open any folder in that window.
-5. Parallax activates automatically and starts recording.
-6. Open the Parallax sidebar (clock icon in the activity bar).
-7. Use the Command Palette (`Ctrl+Shift+P`) for `Parallax: …` commands.
-
----
-
-## Available Commands
-
-| Command | Description |
-|---|---|
-| `Parallax: Start Recording` | Begin recording file events |
-| `Parallax: Stop Recording` | Stop recording |
-| `Parallax: Open Timeline` | Open the Parallax sidebar timeline |
-| `Parallax: Create Checkpoint` | Save a named milestone |
-
----
-
-## Running Tests
-
-```bash
-# Compile extension + tests
-npx tsc -p tsconfig.test.json
-
-# Run all unit tests
-npx mocha "out/test/**/*.test.js" --timeout 10000 --exit
-```
-
-Or via the npm script:
-
-```bash
 npm test
+npm run test:integration
 ```
 
-### Test results
+Press **F5** to launch the Extension Development Host, open a project folder, then select the Parallax Activity Bar view. `npm run test:integration` launches the official VS Code test host on an isolated workspace. `npm test` includes core and browser-DOM webview interaction tests. Run `npm run package` to create a VSIX. A license has not been selected; the VSIX must not be published until the project owner chooses licensing terms and adds the corresponding license file.
 
-```
-89 passing
-```
-
-Tests cover: event creation/serialization, SHA-256 hashing, diff generation/application, exclusion matching, storage persistence, historical state reconstruction, and checkpoints.
-
----
+For a packaged-extension host probe after installing the VSIX into an isolated extension directory, set `PARALLAX_INSTALLED_EXTENSION`, `PARALLAX_INSTALL_PROFILE`, and optionally `VSCODE_EXECUTABLE`, then run `npm run test:package-host`. The final VSIX was installed into a clean profile and passed the packaged-host suite, including Activity Bar/view contributions, activation, recording, root changes, and opening reconstructed history as a read-only TypeScript document. Browser-DOM tests cover timeline, compare, replay, checkpoint, and restore-preview requests. Manual visual review of light/dark/high-contrast themes and panel widths remains outstanding.
 
 ## Settings
 
-| Setting | Default | Description |
-|---|---|---|
-| `parallax.recordingEnabled` | `true` | Auto-start recording on VS Code startup |
-| `parallax.snapshotIntervalMinutes` | `30` | Interval between automatic full snapshots |
-| `parallax.excludePatterns` | See defaults | Directories/patterns excluded from recording |
-| `parallax.maxEventsPerSession` | `10000` | Maximum events retained per session |
-| `parallax.debounceMs` | `1000` | Debounce interval for file modification events |
+| Setting | Default | Purpose |
+|---|---:|---|
+| `parallax.recordingEnabled` | `true` | Automatically record when a workspace opens. |
+| `parallax.snapshotIntervalMinutes` | `30` | Periodic reconstruction snapshot interval. |
+| `parallax.excludePatterns` | See `package.json` | Glob exclusions. |
+| `parallax.maxEventsPerSession` | `10000` | Target event retention bound; pruning waits for a safe snapshot anchor. |
+| `parallax.debounceMs` | `1000` | File watcher debounce interval. |
 
----
-
-## Known Limitations
-
-- **Binary files** are not hashed or stored (only UTF-8 text files are processed).
-- **Very large files** (images, compiled assets) may be slow to hash; exclude them via `parallax.excludePatterns`.
-- The webview is 1.1 MiB in development mode (React + react-dom dev build). A production webpack build would reduce this significantly.
-- Historical reconstruction is accurate for text files but has not been tested with files > 10 MB.
-- The VS Code Git integration requires the built-in `vscode.git` extension to be active; if it is disabled, Git events are silently skipped.
-- There is no UI for browsing all sessions yet — the timeline shows the current/most recent session's events.
-
----
-
-## What Remains for Phase 2
-
-- Backend sync (FastAPI + PostgreSQL)
-- AI/BYOK integration (prompt attribution, code provenance)
-- RAG over development history
-- Software forensics and bug-origin analysis
-- Multi-device / team history sync
-- Web dashboard
-- Production packaging (minified webview bundle, VSIX publish)
-- Advanced timeline filtering, search, and annotation
-
-See `docs/implementation-status.md` for the full Phase 2 backlog.
+See `ARCHITECTURE.md`, `docs/features/`, and `docs/review/INDEPENDENT_REVIEWER.md` for design details and verification policy. Causal Rewind is future work.
